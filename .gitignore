@@ -170,3 +170,7 @@ artifacts/
 
 # Optional: large prediction outputs
 predictions.csv
+# Ignore full Kaggle datasets
+data/train.csv
+data/test.csv
+data/gender_submission.csv
