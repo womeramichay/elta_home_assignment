@@ -1,293 +1,286 @@
 #!/usr/bin/env python3
 # train.py
+"""
+Fetches Titanic dataset directly from Kaggle in code
+Loads + preprocesses data (fit on train split only)
+Trains a PyTorch classifier with a SMALL grid search + early stopping
+Evaluates on a held-out test split
+Saves:
+    artifacts/model.pt          (PyTorch state_dict + model metadata)
+    artifacts/preprocess.pkl    (fitted sklearn preprocessing pipeline + feature names)
+    artifacts/metrics.json      (best params + test metrics + split sizes)
+"""
 
 import argparse
 import json
 import os
+import pickle
+import random
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, confusion_matrix
-
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 
-# -----------------------------
-# Columns / feature choices
-# -----------------------------
+# Feature config 
 TARGET_COL = "Survived"
 
+# Keep it simple and strong:
+# - Treat Pclass as categorical (often works better than numeric)
 NUM_COLS = ["Age", "SibSp", "Parch", "Fare"]
-CAT_COLS = ["Sex", "Embarked", "Pclass"]  # keep Pclass as categorical signal
+CAT_COLS = ["Sex", "Embarked", "Pclass"]
 
 
 # -----------------------------
-# Data loading + cleaning
+# Reproducibility
 # -----------------------------
-def load_and_clean(csv_path: Path) -> pd.DataFrame:
-    df = pd.read_csv(csv_path)
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Deterministic may reduce speed slightly but helps reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
-    # Drop columns you decided to remove (safe even if missing)
-    drop_cols = ["PassengerId", "Name", "Ticket", "Cabin"]
-    df = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
 
-    # Basic imputations (deterministic)
-    if "Age" in df.columns:
-        df["Age"] = df["Age"].fillna(df["Age"].median())
+# -----------------------------
+# Kaggle download
+# -----------------------------
+def download_kaggle_titanic(data_dir: Path) -> Tuple[Path, Optional[Path]]:
+    """
+    Downloads Titanic competition files into data_dir using Kaggle API.
 
-    if "Fare" in df.columns:
-        df["Fare"] = df["Fare"].fillna(df["Fare"].median())
+    Requirements:
+    - kaggle package installed (pip install kaggle)
+    - credentials set via:
+        ~/.kaggle/kaggle.json  OR  env vars KAGGLE_USERNAME / KAGGLE_KEY
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    if "Embarked" in df.columns:
-        mode = df["Embarked"].mode()
-        df["Embarked"] = df["Embarked"].fillna(mode.iloc[0] if len(mode) else "S")
+    train_path = data_dir / "train.csv"
+    test_path = data_dir / "test.csv"
 
-    # Ensure types
-    df["Pclass"] = df["Pclass"].astype(str)   # treat as categorical
-    df["Sex"] = df["Sex"].astype(str)
-    df["Embarked"] = df["Embarked"].astype(str)
+    # If already present, reuse (reproducible, faster)
+    if train_path.exists():
+        return train_path, test_path if test_path.exists() else None
 
-    # Keep only needed columns + target (if exists)
-    keep = [c for c in (NUM_COLS + CAT_COLS + [TARGET_COL]) if c in df.columns]
-    df = df[keep].copy()
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+    except Exception as e:
+        raise RuntimeError(
+            "Kaggle API not available. Install it with: pip install kaggle\n"
+            "and ensure you have credentials (~/.kaggle/kaggle.json or env vars)."
+        ) from e
+
+    api = KaggleApi()
+    api.authenticate()
+
+    # Download competition files (zip) then unzip
+    api.competition_download_files("titanic", path=str(data_dir), quiet=False)
+    zip_path = data_dir / "titanic.zip"
+    if not zip_path.exists():
+        # Kaggle sometimes names it differently; try to find any zip
+        zips = list(data_dir.glob("*.zip"))
+        if not zips:
+            raise RuntimeError("Failed to download titanic zip from Kaggle.")
+        zip_path = zips[0]
+
+    import zipfile
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(path=str(data_dir))
+
+    # Clean up zip (optional)
+    try:
+        zip_path.unlink()
+    except Exception:
+        pass
+
+    if not train_path.exists():
+        raise RuntimeError(f"Expected {train_path} after download, but it was not found.")
+
+    return train_path, test_path if test_path.exists() else None
+
+
+# -----------------------------
+# Data loading + light cleaning
+# -----------------------------
+def load_raw_train_csv(train_csv: Path) -> pd.DataFrame:
+    df = pd.read_csv(train_csv)
+
+    # Minimal sanity checks
+    required = set(NUM_COLS + CAT_COLS + [TARGET_COL])
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Training CSV is missing required columns: {sorted(missing)}")
+
+    # Keep only what we need (less chance of leakage / mismatch)
+    df = df[NUM_COLS + CAT_COLS + [TARGET_COL]].copy()
+
+    # Ensure dtypes are safe
+    for c in CAT_COLS:
+        df[c] = df[c].astype(str)
 
     return df
 
 
-def df_to_model_inputs(df: pd.DataFrame) -> dict:
-    """Convert a feature dataframe into Keras input dict."""
-    inputs = {}
-    for c in NUM_COLS:
-        inputs[c] = df[c].astype("float32").to_numpy()
-    for c in CAT_COLS:
-        inputs[c] = df[c].astype(str).to_numpy()
-    return inputs
+def build_preprocessor() -> ColumnTransformer:
+    """
+    Fit this ONLY on train split.
+    Then use the fitted object to transform val/test and later inference in ds_app.py.
+    """
+    num_pipe = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    cat_pipe = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ]
+    )
+
+    pre = ColumnTransformer(
+        transformers=[
+            ("num", num_pipe, NUM_COLS),
+            ("cat", cat_pipe, CAT_COLS),
+        ],
+        remainder="drop",
+        verbose_feature_names_out=False,
+    )
+    return pre
+
+
+def get_feature_names(preprocessor: ColumnTransformer) -> List[str]:
+    # Works for sklearn >= 1.0; if not available, we fall back to generic
+    try:
+        names = preprocessor.get_feature_names_out()
+        return [str(x) for x in names]
+    except Exception:
+        # fallback
+        return [f"f{i}" for i in range(preprocessor.transform(pd.DataFrame(columns=NUM_COLS + CAT_COLS)).shape[1])]
 
 
 # -----------------------------
-# Model building (preprocessing inside model)
+# PyTorch model
 # -----------------------------
-def make_activation(name: str):
-    name = name.lower()
-    if name == "relu":
-        return layers.Activation("relu")
-    if name == "gelu":
-        return layers.Activation(tf.nn.gelu)
-    if name == "leakyrelu":
-        return layers.LeakyReLU(negative_slope=0.1)
-    raise ValueError(f"Unknown activation: {name}. Choose from: relu, gelu, leakyrelu")
+class MLP(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_units: Tuple[int, ...] = (128, 64),
+        dropout: float = 0.3,
+        batch_norm: bool = True,
+        activation: str = "relu",
+    ):
+        super().__init__()
+
+        act_layer: nn.Module
+        activation = activation.lower()
+        if activation == "relu":
+            act_layer = nn.ReLU()
+        elif activation == "gelu":
+            act_layer = nn.GELU()
+        elif activation == "leakyrelu":
+            act_layer = nn.LeakyReLU(0.1)
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+        layers: List[nn.Module] = []
+        prev = input_dim
+        for i, h in enumerate(hidden_units):
+            layers.append(nn.Linear(prev, h))
+            if batch_norm:
+                layers.append(nn.BatchNorm1d(h))
+            layers.append(act_layer)
+            if dropout and dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            prev = h
+
+        layers.append(nn.Linear(prev, 1))  # logits
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(1)  # (N,)
 
 
-def build_model(
-    X_train_df: pd.DataFrame,
-    hidden_units=(128, 64),
-    dropout=0.3,
-    batch_norm=True,
-    activation="gelu",
-    lr=1e-3,
-    seed=42,
-):
-    tf.random.set_seed(seed)
-    np.random.seed(seed)
+@dataclass
+class TrainConfig:
+    lr: float
+    weight_decay: float
+    hidden_units: Tuple[int, ...]
+    dropout: float
+    batch_norm: bool
+    activation: str
+    batch_size: int
+    max_epochs: int
+    patience: int
 
-    # ---- Inputs
-    inputs = {}
-    for c in NUM_COLS:
-        inputs[c] = keras.Input(shape=(), name=c, dtype=tf.float32)
-    for c in CAT_COLS:
-        inputs[c] = keras.Input(shape=(), name=c, dtype=tf.string)
 
-    # ---- Numeric preprocessing
-    num_stack = layers.Concatenate(name="num_concat")([inputs[c] for c in NUM_COLS])
-    normalizer = layers.Normalization(name="num_norm")
-    normalizer.adapt(X_train_df[NUM_COLS].astype("float32").to_numpy())
-    num_encoded = normalizer(num_stack)
-
-    # ---- Categorical preprocessing
-    cat_encoded_parts = []
-    for c in CAT_COLS:
-        lookup = layers.StringLookup(output_mode="int", name=f"{c}_lookup")
-        lookup.adapt(X_train_df[c].astype(str).to_numpy())
-
-        ids = lookup(inputs[c])
-        onehot = layers.CategoryEncoding(num_tokens=lookup.vocabulary_size(), output_mode="one_hot", name=f"{c}_onehot")(ids)
-        cat_encoded_parts.append(onehot)
-
-    cat_encoded = layers.Concatenate(name="cat_concat")(cat_encoded_parts)
-
-    # ---- Combine
-    x = layers.Concatenate(name="features")([num_encoded, cat_encoded])
-
-    # ---- MLP
-    act = make_activation(activation)
-
-    for i, units in enumerate(hidden_units):
-        x = layers.Dense(units, name=f"dense_{i}")(x)
-        if batch_norm:
-            x = layers.BatchNormalization(name=f"bn_{i}")(x)
-        x = act(x)
-        if dropout and dropout > 0:
-            x = layers.Dropout(dropout, name=f"drop_{i}")(x)
-
-    out = layers.Dense(1, activation="sigmoid", name="out")(x)
-
-    model = keras.Model(inputs=inputs, outputs=out, name="titanic_mlp")
-
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=lr),
-        loss="binary_crossentropy",
-        metrics=[keras.metrics.BinaryAccuracy(name="acc")],
+def make_loaders(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    batch_size: int,
+) -> Tuple[DataLoader, DataLoader]:
+    train_ds = TensorDataset(
+        torch.from_numpy(X_train).float(),
+        torch.from_numpy(y_train).float(),
     )
-    return model
-
-
-# -----------------------------
-# Train + evaluate
-# -----------------------------
-def eval_on_split(model, X_df, y, threshold=0.5):
-    probs = model.predict(df_to_model_inputs(X_df), verbose=0).ravel()
-    y_hat = (probs >= threshold).astype(int)
-
-    f1 = float(f1_score(y, y_hat))
-    acc = float(accuracy_score(y, y_hat))
-    prec = float(precision_score(y, y_hat, zero_division=0))
-    rec = float(recall_score(y, y_hat, zero_division=0))
-    cm = confusion_matrix(y, y_hat).tolist()
-
-    return {"f1": f1, "accuracy": acc, "precision": prec, "recall": rec, "confusion_matrix": cm}
-
-
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data", required=True, help="Path to CSV (train dataset with Survived column).")
-    p.add_argument("--out_dir", default="artifacts", help="Directory to save artifacts.")
-    p.add_argument("--seed", type=int, default=42)
-
-    p.add_argument("--val_size", type=float, default=0.2)
-    p.add_argument("--test_size", type=float, default=0.2)
-
-    p.add_argument("--epochs", type=int, default=80)
-    p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--patience", type=int, default=10)
-
-    p.add_argument("--threshold", type=float, default=0.5)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--activation", choices=["relu", "gelu", "leakyrelu"], default="gelu")
-    p.add_argument("--dropout", type=float, default=0.3)
-    p.add_argument("--hidden_units", type=int, nargs="+", default=[128, 64])
-    p.add_argument("--no_batch_norm", action="store_true")
-
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    data_path = Path(args.data)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1) Load/clean
-    df = load_and_clean(data_path)
-
-    if TARGET_COL not in df.columns:
-        raise ValueError(f"CSV must contain target column '{TARGET_COL}' for training/evaluation.")
-
-    X = df[NUM_COLS + CAT_COLS].copy()
-    y = df[TARGET_COL].astype(int).to_numpy()
-
-    # 2) Train/val/test split (held-out test)
-    X_train, X_tmp, y_train, y_tmp = train_test_split(
-        X,
-        y,
-        test_size=args.test_size + args.val_size,
-        random_state=args.seed,
-        stratify=y,
-    )
-    relative_test = args.test_size / (args.test_size + args.val_size)
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_tmp,
-        y_tmp,
-        test_size=relative_test,
-        random_state=args.seed,
-        stratify=y_tmp,
+    val_ds = TensorDataset(
+        torch.from_numpy(X_val).float(),
+        torch.from_numpy(y_val).float(),
     )
 
-    # 3) Build model (preprocessing adapts ONLY on train split)
-    model = build_model(
-        X_train_df=X_train,
-        hidden_units=tuple(args.hidden_units),
-        dropout=args.dropout,
-        batch_norm=(not args.no_batch_norm),
-        activation=args.activation,
-        lr=args.lr,
-        seed=args.seed,
-    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    return train_loader, val_loader
 
-    callbacks = [
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=args.patience,
-            restore_best_weights=True,
-        )
-    ]
 
-    # 4) Train
-    model.fit(
-        df_to_model_inputs(X_train),
-        y_train,
-        validation_data=(df_to_model_inputs(X_val), y_val),
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        verbose=1,
-        callbacks=callbacks,
-    )
+@torch.no_grad()
+def predict_proba(model: nn.Module, X: np.ndarray, device: torch.device) -> np.ndarray:
+    model.eval()
+    xb = torch.from_numpy(X).float().to(device)
+    logits = model(xb)
+    prob = torch.sigmoid(logits).detach().cpu().numpy()
+    return prob.reshape(-1)
 
-    # 5) Evaluate on held-out test
-    test_metrics = eval_on_split(model, X_test, y_test, threshold=args.threshold)
 
-    # 6) Save artifacts
-    model_path = out_dir / "model.keras"
-    metrics_path = out_dir / "metrics.json"
-
-    model.save(model_path)
-
-    payload = {
-        "data_path": str(data_path),
-        "n_rows": int(df.shape[0]),
-        "splits": {
-            "train": int(len(X_train)),
-            "val": int(len(X_val)),
-            "test": int(len(X_test)),
-        },
-        "features": {"num": NUM_COLS, "cat": CAT_COLS},
-        "hyperparams": {
-            "seed": args.seed,
-            "lr": args.lr,
-            "activation": args.activation,
-            "dropout": args.dropout,
-            "hidden_units": args.hidden_units,
-            "batch_norm": (not args.no_batch_norm),
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "patience": args.patience,
-            "threshold": args.threshold,
-        },
-        "test_metrics": test_metrics,
+@torch.no_grad()
+def eval_metrics(y_true: np.ndarray, prob: np.ndarray, threshold: float) -> Dict:
+    y_pred = (prob >= threshold).astype(int)
+    return {
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
     }
 
-    metrics_path.write_text(json.dumps(payload, indent=2))
-    print(f"\nSaved model to:   {model_path}")
-    print(f"Saved metrics to: {metrics_path}")
-    print("\nHeld-out TEST metrics:")
-    print(json.dumps(test_metrics, indent=2))
 
-
-if __name__ == "__main__":
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-    main()
+def train_one_config(
+    cfg: TrainConfig,
+    X_train: np.ndarray,
