@@ -116,28 +116,3 @@ enter your email adress and he app will open in your browser (usually at `http:/
 
 
 
-
-
-
-
----
-
-## Architecture & Design Choices
-
-- Clear separation of concerns:
-  - `train.py` handles data loading, preprocessing, training, evaluation, and artifact creation
-  - `ds_app.py` handles inference and visualization only
-- **Model persistence**:
-  - Preprocessing and model weights are saved and reused without retraining
-- **PyTorch model**:
-  - Chosen to demonstrate flexibility and production-style workflows
-- **Streamlit UI**:
-  - Lightweight interface for demonstrating inference and evaluation
-- **Reproducibility**:
-  - Fixed random seeds and deterministic splits
-- **Minimal committed data**:
-  - Only a small sample dataset is tracked to keep the repository lightweight
-
-This structure mirrors a realistic machine learning workflow and is designed to be easy to review, run, and extend.
-
-
