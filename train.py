@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # train.py
 """
-Titanic (Kaggle) end-to-end training script (PyTorch)
-
-What this script does (per assignment):
 - Fetches Titanic dataset directly from Kaggle in code
 - Loads + preprocesses data (fit on train split only)
 - Trains a PyTorch classifier with a SMALL grid search + early stopping
